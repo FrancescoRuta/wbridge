@@ -3,7 +3,7 @@ use std::sync::{atomic::AtomicU32, Arc};
 use bytes::{BytesMut, BufMut};
 use dashmap::DashMap;
 
-use crate::{connection::Connection, stop_handle::{StopHandleSnd, self}, HEADER_SIZE};
+use crate::{connection::Connection, stop_handle::{StopHandleSnd, self}, HEADER_SIZE, message::{Message, BroadcastMessage, PrepardMessage}};
 
 pub struct Client<W, R> {
     id: u32,
@@ -161,32 +161,44 @@ impl RunningClient {
         }
     }
     
-    pub async fn open_new_channel(&self) -> Channel {
+    pub async fn open_new_channel(&self) -> (ChannelWriteHalf, ChannelReadHalf) {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         loop {
             let id = self.next_channel_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if let dashmap::mapref::entry::Entry::Vacant(e) = self.data_channels.entry(id) {
                 e.insert(tx);
-                return Channel {
-                    conn_id: self.id,
-                    channel_id: id,
-                    data_reader: rx,
-                    data_writer: self.data_writer.clone(),
-                };
+                return (
+                    ChannelWriteHalf {
+                        conn_id: self.id,
+                        channel_id: id,
+                        data_writer: self.data_writer.clone(),
+                    },
+                    ChannelReadHalf {
+                        conn_id: self.id,
+                        channel_id: id,
+                        data_reader: rx,
+                    },
+                );
             }
         }
     }
     
-    pub async fn get_channel_if_free(&self, channel: u32) -> Option<Channel> {
+    pub async fn get_channel_if_free(&self, channel: u32) -> Option<(ChannelWriteHalf, ChannelReadHalf)> {
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         if let dashmap::mapref::entry::Entry::Vacant(e) = self.data_channels.entry(channel) {
             e.insert(tx);
-            Some(Channel {
-                conn_id: self.id,
-                channel_id: channel,
-                data_reader: rx,
-                data_writer: self.data_writer.clone(),
-            })
+            Some((
+                ChannelWriteHalf {
+                    conn_id: self.id,
+                    channel_id: channel,
+                    data_writer: self.data_writer.clone(),
+                },
+                ChannelReadHalf {
+                    conn_id: self.id,
+                    channel_id: channel,
+                    data_reader: rx,
+                },
+            ))
         } else {
             None
         }
@@ -218,14 +230,35 @@ impl BroadcastSubscription {
     }
 }
 
-pub struct Channel {
+pub struct ChannelReadHalf {
     conn_id: u32,
     channel_id: u32,
-    data_writer: tokio::sync::mpsc::Sender<bytes::Bytes>,
     data_reader: tokio::sync::mpsc::Receiver<Message>,
 }
 
-impl Channel {
+impl ChannelReadHalf {
+    pub fn conn_id(&self) -> u32 {
+        self.conn_id
+    }
+    pub fn id(&self) -> u32 {
+        self.channel_id
+    }
+    pub async fn read(&mut self) -> Option<Message> {
+        self.data_reader.recv().await
+    }
+}
+
+#[derive(Clone)]
+pub struct ChannelWriteHalf {
+    conn_id: u32,
+    channel_id: u32,
+    data_writer: tokio::sync::mpsc::Sender<bytes::Bytes>,
+}
+
+impl ChannelWriteHalf {
+    pub fn conn_id(&self) -> u32 {
+        self.conn_id
+    }
     pub fn id(&self) -> u32 {
         self.channel_id
     }
@@ -244,66 +277,16 @@ impl Channel {
     pub async fn send_broadcast(&self, data: impl AsRef<[u8]>) -> Result<(), ()> {
         self.send(0, 0, data).await
     }
-    pub async fn read(&mut self) -> Option<Message> {
-        self.data_reader.recv().await
-    }
-}
-
-pub struct PrepardMessage {
-    buffer: bytes::BytesMut,
-    len: usize,
-    max_len: usize,
-}
-
-impl PrepardMessage {
-    
-    pub fn new(size: usize) -> Self {
-        Self {
-            buffer: bytes::BytesMut::zeroed(HEADER_SIZE + size),
-            len: size,
-            max_len: size
-        }
-    }
-    
-    pub fn get_buffer(&self) -> &[u8] {
-        &self.buffer[HEADER_SIZE..(HEADER_SIZE + self.len)]
-    }
-    
-    pub fn get_buffer_mut(&mut self) -> &mut [u8] {
-        &mut self.buffer[HEADER_SIZE..(HEADER_SIZE + self.len)]
-    }
-    
-    pub fn resize(&mut self, len: usize) -> Result<(), ()> {
-        if len <= self.max_len {
-            self.len = len;
-            Ok(())
-        } else {
-            Err(())
-        }
-    }
-    
-    pub async fn send(mut self, by_channel: &Channel, addr: u32, channel: u32) -> Result<(), ()> {
-        self.buffer[0..4].copy_from_slice(&(self.len as u32).to_be_bytes());
-        self.buffer[4..8].copy_from_slice(&by_channel.conn_id.to_be_bytes());
-        self.buffer[8..12].copy_from_slice(&by_channel.channel_id.to_be_bytes());
-        self.buffer[12..16].copy_from_slice(&addr.to_be_bytes());
-        self.buffer[16..20].copy_from_slice(&channel.to_be_bytes());
-        by_channel.data_writer.send(self.buffer.freeze()).await.map_err(|_| ())?;
+    pub async fn send_prepared(&self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<(), ()> {
+        message.buffer[0..4].copy_from_slice(&(message.len as u32).to_be_bytes());
+        message.buffer[4..8].copy_from_slice(&self.conn_id().to_be_bytes());
+        message.buffer[8..12].copy_from_slice(&self.id().to_be_bytes());
+        message.buffer[12..16].copy_from_slice(&addr.to_be_bytes());
+        message.buffer[16..20].copy_from_slice(&channel.to_be_bytes());
+        self.data_writer.send(message.buffer.freeze()).await.map_err(|_| ())?;
         Ok(())
     }
-    
-}
-
-pub struct Message {
-    pub from_conn: u32,
-    pub from_channel: u32,
-    pub to_conn: u32,
-    pub to_channel: u32,
-    pub data: bytes::Bytes,
-}
-
-pub struct BroadcastMessage {
-    pub from_conn: u32,
-    pub from_channel: u32,
-    pub data: bytes::Bytes,
+    pub async fn send_prepared_broadcast(&self, message: PrepardMessage) -> Result<(), ()> {
+        self.send_prepared(0, 0, message).await
+    }
 }

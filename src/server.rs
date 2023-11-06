@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::{atomic::AtomicBool, Arc}};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use crate::{connection::Connection, stop_handle::StopHandleSnd};
+use crate::{connection::Connection, stop_handle::StopHandleSnd, message::{PrepardMessage, Message, BroadcastMessage}, HEADER_SIZE};
 
 pub struct Server<W, R> {
     accept_connection_tx: tokio::sync::mpsc::Sender<(u32, Connection<W, R>)>,
@@ -11,6 +11,8 @@ pub struct Server<W, R> {
 
 pub struct RunningServer<W, R> {
     stop_tx: StopHandleSnd,
+    connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
     accept_connection_tx: tokio::sync::mpsc::Sender<(u32, Connection<W, R>)>,
     server_future: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>>,
 }
@@ -35,23 +37,31 @@ where
             accept_connection_tx,
             mut accept_connection_rx,
         } = self;
-        let server_future = tokio::spawn(async move {
-            let runtime = ServerRuntime::new();
-            loop {
-                tokio::select! {
-                    _ = stop_rx.wait() => break,
-                    conn = accept_connection_rx.recv() => {
-                        if let Some(conn) = conn {
-                            let _ = runtime.push_connection(conn).await;
-                        } else {
-                            break
-                        }
-                    },
+        let connections = Arc::new(DashMap::new());
+        let broadcast_subscriptions = Arc::new(DashMap::new());
+        let server_future = tokio::spawn({
+            let connections = Arc::clone(&connections);
+            let broadcast_subscriptions = Arc::clone(&broadcast_subscriptions);
+            async move {
+                let runtime = ServerRuntime::new(connections, broadcast_subscriptions);
+                loop {
+                    tokio::select! {
+                        _ = stop_rx.wait() => break,
+                        conn = accept_connection_rx.recv() => {
+                            if let Some(conn) = conn {
+                                let _ = runtime.push_connection(conn).await;
+                            } else {
+                                break
+                            }
+                        },
+                    }
                 }
+                Ok(())
             }
-            Ok(())
         });
         RunningServer {
+            connections,
+            broadcast_subscriptions,
             accept_connection_tx,
             server_future,
             stop_tx,
@@ -64,6 +74,24 @@ impl<W, R> RunningServer<W, R> {
     
     pub async fn push_connection(&self, conn: (u32, Connection<W, R>)) -> Result<(), tokio::sync::mpsc::error::SendError<(u32, Connection<W, R>)>> {
         self.accept_connection_tx.send(conn).await
+    }
+    
+    pub fn get_local_connection_factory(&self) -> LocalConnectionFactory {
+        LocalConnectionFactory {
+            connections: Arc::clone(&self.connections),
+            broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+        }
+    }
+    
+    pub fn get_local_connection(&self, connection_id: u32) -> LocalConnection {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        self.connections.insert(connection_id, tx);
+        LocalConnection {
+            connection_id,
+            data_rx: rx,
+            connections: Arc::clone(&self.connections),
+            broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+        }
     }
     
     pub async fn stop(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -82,12 +110,12 @@ struct ServerRuntime {
 
 impl ServerRuntime {
     
-    pub fn new() -> Self {
+    pub fn new(connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>, broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>) -> Self {
         Self {
             is_stopped: AtomicBool::new(false),
             stop_tx_list: Arc::new(Mutex::new(BTreeMap::new())),
-            connections: Arc::new(DashMap::new()),
-            broadcast_subscriptions: Arc::new(DashMap::new()),
+            connections,
+            broadcast_subscriptions,
         }
     }
     
@@ -244,4 +272,222 @@ impl ServerRuntime {
         Ok(())
     }
     
+}
+
+#[derive(Clone)]
+pub struct LocalConnectionFactory {
+    connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+}
+
+impl LocalConnectionFactory {
+    
+    pub fn get_local_connection(&self, connection_id: u32) -> LocalConnection {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        self.connections.insert(connection_id, tx);
+        LocalConnection {
+            connection_id,
+            data_rx: rx,
+            connections: Arc::clone(&self.connections),
+            broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+        }
+    }
+    
+}
+
+pub struct LocalConnection {
+    connection_id: u32,
+    data_rx: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+}
+
+impl LocalConnection {
+    
+    pub fn get_broadcast_subscription_factory(&self) -> BroadcastSubscriptionFactory {
+        BroadcastSubscriptionFactory {
+            connection_id: self.connection_id,
+            broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+        }
+    }
+    pub fn subscribe_to_broadcast(&self, addr: u32, channel: u32) -> Result<BroadcastSubscription, ()> {
+        let broadcast_channel = (addr as u64) << 32 | channel as u64;
+        if let Some(b) = self.broadcast_subscriptions.get(&broadcast_channel) {
+            if let dashmap::mapref::entry::Entry::Vacant(e) = b.entry(self.connection_id) {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                e.insert(tx);
+                Ok(BroadcastSubscription {
+                    this_connection_id: self.connection_id,
+                    broadcast_channel,
+                    broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+                    data_reader: rx,
+                })
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+    
+    pub fn get_writer_factory(&self) -> LocalConnectionWriterFactory {
+        LocalConnectionWriterFactory {
+            conn_id: self.connection_id,
+            connections: Arc::clone(&self.connections),
+        }
+    }
+    
+    pub async fn read_next(&mut self) -> Option<Message> {
+        if let Some(message) = self.data_rx.recv().await {
+            let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+            let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
+            let to_conn = u32::from_be_bytes([message[12], message[13], message[14], message[15]]);
+            let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
+            Some(Message {
+                from_conn,
+                from_channel,
+                to_conn,
+                to_channel,
+                data: message.slice(HEADER_SIZE..),
+            })
+        } else {
+            None
+        }
+    }
+    
+}
+
+#[derive(Clone)]
+pub struct BroadcastSubscriptionFactory {
+    connection_id: u32,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+}
+
+impl BroadcastSubscriptionFactory {
+    
+    pub fn subscribe_to_broadcast(&self, addr: u32, channel: u32) -> Result<BroadcastSubscription, ()> {
+        let broadcast_channel = (addr as u64) << 32 | channel as u64;
+        if let Some(b) = self.broadcast_subscriptions.get(&broadcast_channel) {
+            if let dashmap::mapref::entry::Entry::Vacant(e) = b.entry(self.connection_id) {
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                e.insert(tx);
+                Ok(BroadcastSubscription {
+                    this_connection_id: self.connection_id,
+                    broadcast_channel,
+                    broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+                    data_reader: rx,
+                })
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+    
+}
+
+pub struct BroadcastSubscription {
+    this_connection_id: u32,
+    broadcast_channel: u64,
+    data_reader: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+}
+
+impl BroadcastSubscription {
+    pub async fn cancel(&self) {
+        if let Some(b) = self.broadcast_subscriptions.get(&self.broadcast_channel) {
+            b.remove(&self.this_connection_id);
+        }
+    }
+    pub async fn read(&mut self) -> Option<BroadcastMessage> {
+        if let Some(message) = self.data_reader.recv().await {
+            let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+            let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
+            Some(BroadcastMessage {
+                from_conn,
+                from_channel,
+                data: message.slice(HEADER_SIZE..),
+            })
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct LocalConnectionWriterFactory {
+    conn_id: u32,
+    connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+}
+
+impl LocalConnectionWriterFactory {
+    
+    pub fn get_writer(&self, channel: u32) -> LocalConnectionWriter {
+        LocalConnectionWriter {
+            conn_id: self.conn_id,
+            channel_id: channel,
+            connections: Arc::clone(&self.connections),
+        }
+    }
+    
+}
+
+
+#[derive(Clone)]
+pub struct LocalConnectionWriter {
+    conn_id: u32,
+    channel_id: u32,
+    connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+}
+
+impl LocalConnectionWriter {
+    pub fn conn_id(&self) -> u32 {
+        self.conn_id
+    }
+    pub fn id(&self) -> u32 {
+        self.channel_id
+    }
+    pub async fn send(&self, addr: u32, channel: u32, data: impl AsRef<[u8]>) -> Result<(), ()> {
+        use bytes::BufMut;
+        if let Some(c) = {self.connections.get(&addr).map(|c| c.clone())} {
+            let data = data.as_ref();
+            let mut request = bytes::BytesMut::with_capacity(20 + data.len());
+            request.put_u32(data.len() as u32);
+            request.put_u32(self.conn_id);
+            request.put_u32(self.channel_id);
+            request.put_u32(addr);
+            request.put_u32(channel);
+            request.put_slice(data);
+            if c.send(request.freeze()).await.is_ok() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+    pub async fn send_broadcast(&self, data: impl AsRef<[u8]>) -> Result<(), ()> {
+        self.send(0, 0, data).await
+    }
+    pub async fn send_prepared(&self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<(), ()> {
+        if let Some(c) = {self.connections.get(&addr).map(|c| c.clone())} {
+            message.buffer[0..4].copy_from_slice(&(message.len as u32).to_be_bytes());
+            message.buffer[4..8].copy_from_slice(&self.conn_id().to_be_bytes());
+            message.buffer[8..12].copy_from_slice(&self.id().to_be_bytes());
+            message.buffer[12..16].copy_from_slice(&addr.to_be_bytes());
+            message.buffer[16..20].copy_from_slice(&channel.to_be_bytes());
+            if c.send(message.buffer.freeze()).await.is_ok() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
+    }
+    pub async fn send_prepared_broadcast(&self, message: PrepardMessage) -> Result<(), ()> {
+        self.send_prepared(0, 0, message).await
+    }
 }
