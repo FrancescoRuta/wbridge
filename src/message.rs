@@ -1,5 +1,8 @@
+use std::marker::PhantomData;
+
 use crate::HEADER_SIZE;
 
+pub struct FrozenMessage<'a>(pub(crate) u32, pub(crate) bytes::Bytes, pub(crate) PhantomData<&'a ()>);
 
 pub struct PrepardMessage {
     pub(crate) buffer: bytes::BytesMut,

@@ -1,9 +1,9 @@
-use std::sync::{atomic::AtomicU32, Arc};
+use std::{sync::{atomic::AtomicU32, Arc}, marker::PhantomData};
 
 use bytes::{BytesMut, BufMut};
 use dashmap::DashMap;
 
-use crate::{connection::Connection, stop_handle::{StopHandleSnd, self}, HEADER_SIZE, message::{Message, BroadcastMessage, PrepardMessage}};
+use crate::{connection::Connection, stop_handle::{StopHandleSnd, self}, HEADER_SIZE, message::{Message, BroadcastMessage, PrepardMessage, FrozenMessage}};
 
 pub struct Client<W, R> {
     id: u32,
@@ -277,16 +277,20 @@ impl ChannelWriteHalf {
     pub async fn send_broadcast(&self, data: impl AsRef<[u8]>) -> Result<(), ()> {
         self.send(0, 0, data).await
     }
-    pub async fn send_prepared(&self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<(), ()> {
+    pub async fn send_prepared<'a>(&'a self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<FrozenMessage<'a>, ()> {
         message.buffer[0..4].copy_from_slice(&(message.len as u32).to_be_bytes());
         message.buffer[4..8].copy_from_slice(&self.conn_id().to_be_bytes());
         message.buffer[8..12].copy_from_slice(&self.id().to_be_bytes());
         message.buffer[12..16].copy_from_slice(&addr.to_be_bytes());
         message.buffer[16..20].copy_from_slice(&channel.to_be_bytes());
-        self.data_writer.send(message.buffer.freeze()).await.map_err(|_| ())?;
-        Ok(())
+        let message = message.buffer.freeze();
+        self.data_writer.send(message.clone()).await.map_err(|_| ())?;
+        Ok(FrozenMessage(addr, message, PhantomData::default()))
     }
-    pub async fn send_prepared_broadcast(&self, message: PrepardMessage) -> Result<(), ()> {
+    pub async fn send_frozen(&self, message: &FrozenMessage<'_>) -> Result<(), ()> {
+        self.data_writer.send(message.1.clone()).await.map_err(|_| ())
+    }
+    pub async fn send_prepared_broadcast<'a>(&'a self, message: PrepardMessage) -> Result<FrozenMessage<'a>, ()> {
         self.send_prepared(0, 0, message).await
     }
 }

@@ -1,8 +1,8 @@
-use std::{collections::BTreeMap, sync::{atomic::AtomicBool, Arc}};
+use std::{collections::BTreeMap, sync::{atomic::AtomicBool, Arc}, marker::PhantomData};
 
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use crate::{connection::Connection, stop_handle::StopHandleSnd, message::{PrepardMessage, Message, BroadcastMessage}, HEADER_SIZE};
+use crate::{connection::Connection, stop_handle::StopHandleSnd, message::{PrepardMessage, Message, BroadcastMessage, FrozenMessage}, HEADER_SIZE};
 
 pub struct Server<W, R> {
     accept_connection_tx: tokio::sync::mpsc::Sender<(u32, Connection<W, R>)>,
@@ -471,15 +471,16 @@ impl LocalConnectionWriter {
     pub async fn send_broadcast(&self, data: impl AsRef<[u8]>) -> Result<(), ()> {
         self.send(0, 0, data).await
     }
-    pub async fn send_prepared(&self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<(), ()> {
+    pub async fn send_prepared<'a>(&'a self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<FrozenMessage<'a>, ()> {
         if let Some(c) = {self.connections.get(&addr).map(|c| c.clone())} {
             message.buffer[0..4].copy_from_slice(&(message.len as u32).to_be_bytes());
             message.buffer[4..8].copy_from_slice(&self.conn_id().to_be_bytes());
             message.buffer[8..12].copy_from_slice(&self.id().to_be_bytes());
             message.buffer[12..16].copy_from_slice(&addr.to_be_bytes());
             message.buffer[16..20].copy_from_slice(&channel.to_be_bytes());
-            if c.send(message.buffer.freeze()).await.is_ok() {
-                Ok(())
+            let message = message.buffer.freeze();
+            if c.send(message.clone()).await.is_ok() {
+                Ok(FrozenMessage(addr, message, PhantomData::default()))
             } else {
                 Err(())
             }
@@ -487,7 +488,18 @@ impl LocalConnectionWriter {
             Err(())
         }
     }
-    pub async fn send_prepared_broadcast(&self, message: PrepardMessage) -> Result<(), ()> {
+    pub async fn send_prepared_broadcast<'a>(&'a self, message: PrepardMessage) -> Result<FrozenMessage<'a>, ()> {
         self.send_prepared(0, 0, message).await
+    }
+    pub async fn send_frozen(&self, message: &FrozenMessage<'_>) -> Result<(), ()> {
+        if let Some(c) = {self.connections.get(&message.0).map(|c| c.clone())} {
+            if c.send(message.1.clone()).await.is_ok() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        } else {
+            Err(())
+        }
     }
 }
