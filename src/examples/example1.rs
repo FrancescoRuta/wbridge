@@ -3,14 +3,6 @@ use connection::Connection;
 use server::{Server, RunningServer};
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, time::Instant, net::tcp::{OwnedWriteHalf, OwnedReadHalf}};
 
-pub mod client;
-mod connection;
-pub mod message;
-pub mod server;
-mod stop_handle;
-
-pub const HEADER_SIZE: usize = 20;
-
 #[tokio::main]
 async fn main() {
     let (stop_handle_snd, stop_handle_rcv) = stop_handle::create();
