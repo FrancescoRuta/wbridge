@@ -77,23 +77,27 @@ where
                     if to_conn == 0 {
                         let brid = (from_conn as u64) << 32 | from_channel as u64;
                         if let Some(b) = {broadcast_subscriptions.get(&brid).map(|b| b.clone())} {
-                            if b.send(BroadcastMessage {
-                                from_conn,
-                                from_channel,
-                                data: message.slice(HEADER_SIZE..),
-                            }).await.is_err() {
+                            if let Ok(b) = b.reserve().await {
+                                b.send(BroadcastMessage {
+                                    from_conn,
+                                    from_channel,
+                                    data: message.slice(HEADER_SIZE..),
+                                });
+                            } else {
                                 broadcast_subscriptions.remove(&brid);
                             }
                         }
                     } else {
                         if let Some(b) = {data_channels.get(&to_channel).map(|b| b.clone())} {
-                            if b.send(Message {
-                                from_conn,
-                                from_channel,
-                                to_conn,
-                                to_channel,
-                                data: message.slice(HEADER_SIZE..),
-                            }).await.is_err() {
+                            if let Ok(b) = b.reserve().await {
+                                b.send(Message {
+                                    from_conn,
+                                    from_channel,
+                                    to_conn,
+                                    to_channel,
+                                    data: message.slice(HEADER_SIZE..),
+                                });
+                            } else {
                                 data_channels.remove(&to_channel);
                             }
                         }

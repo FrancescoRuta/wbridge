@@ -187,9 +187,13 @@ impl ServerRuntime {
                     }
                 };
                 if let Some(snd) = snd {
-                    let _ = snd.send(()).await;
+                    if let Ok(snd) = snd.reserve().await {
+                        snd.send(());
+                    }
                 }
-                let _ = w_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
+                if let Ok(w_notify_stop) = w_notify_stop.reserve().await {
+                    w_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0);
+                }
             }),
             move |rh| Box::pin(async move {
                 let mut broadcast_channels = Vec::new();
@@ -223,7 +227,9 @@ impl ServerRuntime {
                                 .collect::<Vec<_>>();
                             let mut broken_channels = Vec::new();
                             for (key, channel) in channels {
-                                if channel.send(message.clone()).await.is_err() {
+                                if let Ok(channel) = channel.reserve().await {
+                                    channel.send(message.clone());
+                                } else {
                                     broken_channels.push(key);
                                 }
                             }
@@ -233,8 +239,10 @@ impl ServerRuntime {
                                 }
                             }
                         } else {
-                            if let Some(data_tx) = connections.get(&to_conn).map(|c| c.clone()) {
-                                let _ = data_tx.send(message).await;
+                            if let Some(data_tx) = {connections.get(&to_conn).map(|c| c.clone())} {
+                                if let Ok(data_tx) = data_tx.reserve().await {
+                                    data_tx.send(message);
+                                }
                             }
                         }
                     } else {
@@ -255,9 +263,13 @@ impl ServerRuntime {
                     
                 };
                 if let Some(snd) = snd {
-                    let _ = snd.send(()).await;
+                    if let Ok(snd) = snd.reserve().await {
+                        snd.send(());
+                    }
                 }
-                let _ = r_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
+                if let Ok(r_notify_stop) = r_notify_stop.reserve().await {
+                    r_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0);
+                }
                 for channel in broadcast_channels {
                     broadcast_subscriptions.remove(&channel);
                 }

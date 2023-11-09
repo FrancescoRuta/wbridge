@@ -5,7 +5,9 @@ pub struct StopHandleRcv(tokio::sync::mpsc::Receiver<()>);
 impl StopHandleSnd {
     
     pub async fn send_stop(self) {
-        let _ = self.0.send(()).await;
+        if let Ok(snd) = self.0.reserve().await {
+            snd.send(());
+        }
     }
     
 }
