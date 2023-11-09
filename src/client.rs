@@ -12,7 +12,7 @@ pub struct Client<Connection> {
 
 impl<Connection> Client<Connection>
 where
-    Connection: DuplexConnection + Send,
+    Connection: DuplexConnection + Send + 'static,
 {
     
     pub fn new(id: u32, connection: Connection) -> Self {
@@ -32,79 +32,81 @@ where
         let mut join_handles = Vec::new();
         let w_notify_stop = stop_tx.clone();
         let r_notify_stop = stop_tx.clone();
+        let mut connection = self.connection;
         
         join_handles.push(tokio::spawn(async move {
             stop_rx.wait().await;
             stop_tx_w.send_stop().await;
             stop_tx_r.send_stop().await;
         }));
-        join_handles.push(self.connection.run_split(move |wh| Box::pin(async move {
-            loop {
-                tokio::select! {
-                    _ = stop_rx_w.wait() => break,
-                    message = data_writer_rx.recv() => {
-                        if let Some(message) = message {
-                            if wh.snd(message).await.is_err() {
-                                break;
-                            }
-                        } else {
-                            break;
-                        }
-                    },
-                }
-            };
-            w_notify_stop.send_stop().await;
-        }), {
+        join_handles.push(tokio::spawn({
             let data_channels = Arc::clone(&data_channels);
             let broadcast_subscriptions = Arc::clone(&broadcast_subscriptions);
-            move |rh| Box::pin(async move {
-                loop {
-                    let message = tokio::select! {
-                        _ = stop_rx_r.wait() => break,
-                        message = rh.rcv() => {
-                            if let Some(message) = message {
-                                message
-                            } else {
-                                break;
-                            }
-                        },
+            async move {
+                let (mut wh, mut rh) = connection.split();
+                let wh = async move {
+                    loop {
+                        tokio::select! {
+                            _ = stop_rx_w.wait() => break,
+                            message = data_writer_rx.recv() => {
+                                if let Some(message) = message {
+                                    if wh.snd(message).await.is_err() {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            },
+                        }
                     };
-                    let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
-                    let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
-                    let to_conn = u32::from_be_bytes([message[12], message[13], message[14], message[15]]);
-                    let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
-                    
-                    if to_conn == 0 {
-                        let brid = (from_conn as u64) << 32 | from_channel as u64;
-                        if let Some(b) = {broadcast_subscriptions.get(&brid).map(|b| b.clone())} {
-                            if let Ok(b) = b.reserve().await {
-                                b.send(BroadcastMessage {
+                    w_notify_stop.send_stop().await;
+                };
+                let rh = async move {
+                    loop {
+                        let message = tokio::select! {
+                            _ = stop_rx_r.wait() => break,
+                            message = rh.rcv() => {
+                                if let Some(message) = message {
+                                    message
+                                } else {
+                                    break;
+                                }
+                            },
+                        };
+                        let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
+                        let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
+                        let to_conn = u32::from_be_bytes([message[12], message[13], message[14], message[15]]);
+                        let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
+                        
+                        if to_conn == 0 {
+                            let brid = (from_conn as u64) << 32 | from_channel as u64;
+                            if let Some(b) = {broadcast_subscriptions.get(&brid).map(|b| b.clone())} {
+                                if b.send(BroadcastMessage {
                                     from_conn,
                                     from_channel,
                                     data: message.slice(HEADER_SIZE..),
-                                });
-                            } else {
-                                broadcast_subscriptions.remove(&brid);
+                                }).await.is_err() {
+                                    broadcast_subscriptions.remove(&brid);
+                                }
                             }
-                        }
-                    } else {
-                        if let Some(b) = {data_channels.get(&to_channel).map(|b| b.clone())} {
-                            if let Ok(b) = b.reserve().await {
-                                b.send(Message {
+                        } else {
+                            if let Some(b) = {data_channels.get(&to_channel).map(|b| b.clone())} {
+                                if b.send(Message {
                                     from_conn,
                                     from_channel,
                                     to_conn,
                                     to_channel,
                                     data: message.slice(HEADER_SIZE..),
-                                });
-                            } else {
-                                data_channels.remove(&to_channel);
+                                }).await.is_err() {
+                                    data_channels.remove(&to_channel);
+                                }
                             }
                         }
-                    }
+                    };
+                    r_notify_stop.send_stop().await;
                 };
-                r_notify_stop.send_stop().await;
-            })
+                tokio::join!(rh, wh);
+            }
         }));
         
         RunningClient {

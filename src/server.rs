@@ -118,7 +118,7 @@ impl ServerRuntime {
         }
     }
     
-    pub async fn push_connection<Connection: DuplexConnection>(&self, (id, conn): (u32, Connection)) -> Result<(), ()> {
+    pub async fn push_connection<Connection: DuplexConnection + Send + 'static>(&self, (id, mut conn): (u32, Connection)) -> Result<(), ()> {
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
         let stop_tx_list = Arc::clone(&self.stop_tx_list);
         
@@ -170,8 +170,9 @@ impl ServerRuntime {
                 connections.remove(&id);
             }
         });
-        conn.run_split(
-            move |wh| Box::pin(async move {
+        tokio::spawn(async move {
+            let (mut wh, mut rh) = conn.split();
+            let wh = async move {
                 let snd = loop {
                     tokio::select! {
                         snd = stop_wh_rx.recv() => break snd,
@@ -187,15 +188,11 @@ impl ServerRuntime {
                     }
                 };
                 if let Some(snd) = snd {
-                    if let Ok(snd) = snd.reserve().await {
-                        snd.send(());
-                    }
+                    let _ = snd.send(()).await;
                 }
-                if let Ok(w_notify_stop) = w_notify_stop.reserve().await {
-                    w_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0);
-                }
-            }),
-            move |rh| Box::pin(async move {
+                let _ = w_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
+            };
+            let rh = async move {
                 let mut broadcast_channels = Vec::new();
                 let snd = loop {
                     let message = tokio::select! {
@@ -227,9 +224,7 @@ impl ServerRuntime {
                                 .collect::<Vec<_>>();
                             let mut broken_channels = Vec::new();
                             for (key, channel) in channels {
-                                if let Ok(channel) = channel.reserve().await {
-                                    channel.send(message.clone());
-                                } else {
+                                if channel.send(message.clone()).await.is_err() {
                                     broken_channels.push(key);
                                 }
                             }
@@ -239,10 +234,8 @@ impl ServerRuntime {
                                 }
                             }
                         } else {
-                            if let Some(data_tx) = {connections.get(&to_conn).map(|c| c.clone())} {
-                                if let Ok(data_tx) = data_tx.reserve().await {
-                                    data_tx.send(message);
-                                }
+                            if let Some(data_tx) = connections.get(&to_conn).map(|c| c.clone()) {
+                                let _ = data_tx.send(message).await;
                             }
                         }
                     } else {
@@ -263,18 +256,15 @@ impl ServerRuntime {
                     
                 };
                 if let Some(snd) = snd {
-                    if let Ok(snd) = snd.reserve().await {
-                        snd.send(());
-                    }
+                    let _ = snd.send(()).await;
                 }
-                if let Ok(r_notify_stop) = r_notify_stop.reserve().await {
-                    r_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0);
-                }
+                let _ = r_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
                 for channel in broadcast_channels {
                     broadcast_subscriptions.remove(&channel);
                 }
-            })
-        );
+            };
+            tokio::join!(rh, wh);
+        });
         
         Ok(())
     }
