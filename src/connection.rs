@@ -8,22 +8,20 @@ use crate::HEADER_SIZE;
 pub trait DuplexConnection {
     type W<'a>: tokio::io::AsyncWrite + Unpin + Send + 'a;
     type R<'a>: tokio::io::AsyncRead + Unpin + Send + 'a;
-    fn run_split<'a, WhFn, RhFn>(self, write_half_future: WhFn, read_half_future: RhFn) -> tokio::task::JoinHandle<()>
+    fn run_split<WhFn, RhFn>(self, write_half_future: WhFn, read_half_future: RhFn) -> tokio::task::JoinHandle<()>
     where
-        Self: 'a,
-        WhFn: for<'b> FnOnce(&'b mut ConnectionWriteHalf<Self::W<'b>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> + Send + 'static,
-        RhFn: for<'b> FnOnce(&'b mut ConnectionReadHalf<Self::R<'b>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> + Send + 'static;
+        WhFn: for<'a> FnOnce(&'a mut ConnectionWriteHalf<Self::W<'a>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> + Send + 'static,
+        RhFn: for<'a> FnOnce(&'a mut ConnectionReadHalf<Self::R<'a>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> + Send + 'static;
 }
 
 impl DuplexConnection for tokio::net::TcpStream {
     type W<'a> = tokio::net::tcp::WriteHalf<'a>;
     type R<'a> = tokio::net::tcp::ReadHalf<'a>;
 
-    fn run_split<'a, WhFn, RhFn>(mut self, write_half_future: WhFn, read_half_future: RhFn) -> tokio::task::JoinHandle<()>
+    fn run_split<WhFn, RhFn>(mut self, write_half_future: WhFn, read_half_future: RhFn) -> tokio::task::JoinHandle<()>
     where
-        Self: 'a,
-        WhFn: for<'b> FnOnce(&'b mut ConnectionWriteHalf<Self::W<'b>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> + Send + 'static,
-        RhFn: for<'b> FnOnce(&'b mut ConnectionReadHalf<Self::R<'b>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> + Send + 'static,
+        WhFn: for<'a> FnOnce(&'a mut ConnectionWriteHalf<Self::W<'a>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> + Send + 'static,
+        RhFn: for<'a> FnOnce(&'a mut ConnectionReadHalf<Self::R<'a>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> + Send + 'static,
     {
         tokio::spawn(async move {
             {
@@ -31,10 +29,7 @@ impl DuplexConnection for tokio::net::TcpStream {
                 let (mut r, mut w) = (ConnectionReadHalf(r), ConnectionWriteHalf(w));
                 let r = read_half_future(&mut r);
                 let w = write_half_future(&mut w);
-                tokio::select! {
-                    _ = r => (),
-                    _ = w => (),
-                }
+                tokio::join!(w, r);
             }
         })
     }
@@ -45,23 +40,17 @@ impl DuplexConnection for tokio::net::UnixStream {
     type W<'a> = tokio::net::unix::WriteHalf<'a>;
     type R<'a> = tokio::net::unix::ReadHalf<'a>;
 
-    fn run_split<'a, WhFn, RhFn>(mut self, write_half_future: WhFn, read_half_future: RhFn) -> tokio::task::JoinHandle<()>
+    fn run_split<WhFn, RhFn>(mut self, write_half_future: WhFn, read_half_future: RhFn) -> tokio::task::JoinHandle<()>
     where
-        Self: 'a,
-        WhFn: for<'b> FnOnce(&'b mut ConnectionWriteHalf<Self::W<'b>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> + Send + 'static,
-        RhFn: for<'b> FnOnce(&'b mut ConnectionReadHalf<Self::R<'b>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'b>> + Send + 'static,
+        WhFn: for<'a> FnOnce(&'a mut ConnectionWriteHalf<Self::W<'a>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> + Send + 'static,
+        RhFn: for<'a> FnOnce(&'a mut ConnectionReadHalf<Self::R<'a>>) -> Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> + Send + 'static,
     {
         tokio::spawn(async move {
-            {
-                let (r, w) = self.split();
-                let (mut r, mut w) = (ConnectionReadHalf(r), ConnectionWriteHalf(w));
-                let r = read_half_future(&mut r);
-                let w = write_half_future(&mut w);
-                tokio::select! {
-                    _ = r => (),
-                    _ = w => (),
-                }
-            }
+            let (r, w) = self.split();
+            let (mut r, mut w) = (ConnectionReadHalf(r), ConnectionWriteHalf(w));
+            let r = read_half_future(&mut r);
+            let w = write_half_future(&mut w);
+            tokio::join!(w, r);
         })
     }
 }
