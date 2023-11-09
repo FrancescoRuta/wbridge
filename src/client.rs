@@ -3,20 +3,19 @@ use std::{sync::{atomic::AtomicU32, Arc}, marker::PhantomData};
 use bytes::{BytesMut, BufMut};
 use dashmap::DashMap;
 
-use crate::{connection::Connection, stop_handle::{StopHandleSnd, self}, HEADER_SIZE, message::{Message, BroadcastMessage, PrepardMessage, FrozenMessage}};
+use crate::{stop_handle::{StopHandleSnd, self}, HEADER_SIZE, message::{Message, BroadcastMessage, PrepardMessage, FrozenMessage}, connection::DuplexConnection};
 
-pub struct Client<W, R> {
+pub struct Client<Connection> {
     id: u32,
-    connection: Connection<W, R>,
+    connection: Connection,
 }
 
-impl<W, R> Client<W, R>
+impl<Connection> Client<Connection>
 where
-    W: tokio::io::AsyncWrite + Unpin + std::marker::Send + std::marker::Sync + 'static,
-    R: tokio::io::AsyncRead + Unpin + std::marker::Send + std::marker::Sync + 'static,
+    Connection: DuplexConnection + Send,
 {
     
-    pub fn new(id: u32, connection: Connection<W, R>) -> Self {
+    pub fn new(id: u32, connection: Connection) -> Self {
         Self {
             id,
             connection,
@@ -33,14 +32,13 @@ where
         let mut join_handles = Vec::new();
         let w_notify_stop = stop_tx.clone();
         let r_notify_stop = stop_tx.clone();
-        let (mut wh, mut rh) = self.connection.split();
         
         join_handles.push(tokio::spawn(async move {
             stop_rx.wait().await;
             stop_tx_w.send_stop().await;
             stop_tx_r.send_stop().await;
         }));
-        join_handles.push(tokio::spawn(async move {
+        join_handles.push(self.connection.run_split(move |wh| Box::pin(async move {
             loop {
                 tokio::select! {
                     _ = stop_rx_w.wait() => break,
@@ -56,11 +54,10 @@ where
                 }
             };
             w_notify_stop.send_stop().await;
-        }));
-        join_handles.push(tokio::spawn({
+        }), {
             let data_channels = Arc::clone(&data_channels);
             let broadcast_subscriptions = Arc::clone(&broadcast_subscriptions);
-            async move {
+            move |rh| Box::pin(async move {
                 loop {
                     let message = tokio::select! {
                         _ = stop_rx_r.wait() => break,
@@ -103,7 +100,7 @@ where
                     }
                 };
                 r_notify_stop.send_stop().await;
-            }
+            })
         }));
         
         RunningClient {
