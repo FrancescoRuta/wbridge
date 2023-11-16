@@ -1,6 +1,6 @@
 use std::{sync::{atomic::AtomicU32, Arc}, marker::PhantomData};
 
-use bytes::{BytesMut, BufMut};
+use bytes::{BytesMut, BufMut, Buf};
 use dashmap::DashMap;
 
 use crate::{stop_handle::{StopHandleSnd, self}, HEADER_SIZE, message::{Message, BroadcastMessage, PrepardMessage, FrozenMessage}, connection::DuplexConnection};
@@ -142,23 +142,31 @@ impl RunningClient {
     }
     
     pub async fn subscribe_to_broadcast(&self, addr: u32, channel: u32) -> Option<BroadcastSubscription> {
-        let mut request = BytesMut::with_capacity(20);
-        request.put_u32(0);
-        request.put_u32(addr);
-        request.put_u32(channel);
-        request.put_u32(0);
-        request.put_u32(0);
-        let _  = self.data_writer.send(request.freeze()).await;
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         if let dashmap::mapref::entry::Entry::Vacant(e) = self.broadcast_subscriptions.entry((addr as u64) << 32 | channel as u64) {
             e.insert(tx);
-            Some(BroadcastSubscription {
-                addr,
-                channel,
-                data_reader: rx,
-                data_writer: self.data_writer.clone(),
-                broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
-            })
+            let mut request = BytesMut::with_capacity(20);
+            request.put_u32(0);
+            request.put_u32(addr);
+            request.put_u32(channel);
+            request.put_u32(0);
+            request.put_u32(0);
+            let _  = self.data_writer.send(request.freeze()).await;
+            if let Some(mut result) = rx.recv().await {
+                if result.data.get_u8() == 0 {
+                    Some(BroadcastSubscription {
+                        addr,
+                        channel,
+                        data_reader: rx,
+                        data_writer: self.data_writer.clone(),
+                        broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
         } else {
             None
         }

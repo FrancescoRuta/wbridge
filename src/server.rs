@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, sync::{atomic::AtomicBool, Arc}, marker::PhantomData};
 
+use bytes::BufMut;
 use dashmap::DashMap;
 use parking_lot::Mutex;
 use crate::{stop_handle::StopHandleSnd, message::{PrepardMessage, Message, BroadcastMessage, FrozenMessage}, HEADER_SIZE, connection::DuplexConnection};
@@ -210,7 +211,7 @@ impl ServerRuntime {
                     let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
                     let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
                     let to_conn = u32::from_be_bytes([message[12], message[13], message[14], message[15]]);
-                    //let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
+                    let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
                     
                     if from_conn == id {
                         if to_conn == 0 {
@@ -241,9 +242,20 @@ impl ServerRuntime {
                     } else {
                         let broadcast_channel = (from_conn as u64) << 32 | from_channel as u64;
                         if to_conn == 0 {
+                            let mut result = bytes::BytesMut::with_capacity(HEADER_SIZE + 1);
+                            result.put_u32(1);
+                            result.put_u32(from_conn);
+                            result.put_u32(from_channel);
+                            result.put_u32(0);
+                            result.put_u32(to_channel);
                             // Subscribe
                             if let Some(c) = broadcast_subscriptions.get(&broadcast_channel) {
                                 c.insert(id, conn_tx.clone());
+                                result.put_u8(0);
+                                let _ = conn_tx.send(result.freeze()).await;
+                            } else {
+                                result.put_u8(1);
+                                let _ = conn_tx.send(result.freeze()).await;
                             }
                         } else {
                             // Unsubscribe
@@ -446,7 +458,6 @@ impl LocalConnectionWriter {
         self.channel_id
     }
     pub async fn send(&self, addr: u32, channel: u32, data: impl AsRef<[u8]>) -> Result<(), ()> {
-        use bytes::BufMut;
         if let Some(c) = {self.connections.get(&addr).map(|c| c.clone())} {
             let data = data.as_ref();
             let mut request = bytes::BytesMut::with_capacity(20 + data.len());

@@ -1,7 +1,13 @@
+pub const HEADER_SIZE: usize = 20;
+pub mod client;
+pub mod connection;
+pub mod message;
+pub mod server;
+mod stop_handle;
+
 use client::Client;
-use connection::Connection;
 use server::{Server, RunningServer};
-use tokio::{io::{AsyncWriteExt, AsyncReadExt}, time::Instant, net::tcp::{OwnedWriteHalf, OwnedReadHalf}};
+use tokio::{io::{AsyncWriteExt, AsyncReadExt}, time::Instant, net::TcpStream};
 
 #[tokio::main]
 async fn main() {
@@ -11,12 +17,12 @@ async fn main() {
     let server_connection_factory = server.get_local_connection_factory();
     let server_handle = tokio::spawn(run_server(server, stop_handle_rcv));
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    let (mut r, w) = tokio::net::TcpSocket::new_v4().unwrap().connect("127.0.0.1:8002".parse().unwrap()).await.unwrap().into_split();
-    let client1_id = r.read_u32().await.unwrap();
-    let client1 = Client::new(client1_id, Connection::new(w, r));
-    let (mut r, w) = tokio::net::TcpSocket::new_v4().unwrap().connect("127.0.0.1:8002".parse().unwrap()).await.unwrap().into_split();
-    let client2_id = r.read_u32().await.unwrap();
-    let client2 = Client::new(client2_id, Connection::new(w, r));
+    let mut conn = tokio::net::TcpSocket::new_v4().unwrap().connect("127.0.0.1:8002".parse().unwrap()).await.unwrap();
+    let client1_id = conn.read_u32().await.unwrap();
+    let client1 = Client::new(client1_id, conn);
+    let mut conn = tokio::net::TcpSocket::new_v4().unwrap().connect("127.0.0.1:8002".parse().unwrap()).await.unwrap();
+    let client2_id = conn.read_u32().await.unwrap();
+    let client2 = Client::new(client2_id, conn);
     
     let server_conn_handle = tokio::spawn(async move {
         let mut conn = server_connection_factory.get_local_connection(1);
@@ -98,26 +104,25 @@ async fn main() {
     let _ = server_conn_handle.await;
 }
 
-async fn run_server(server: RunningServer<OwnedWriteHalf, OwnedReadHalf>, mut stop_handle_rcv: stop_handle::StopHandleRcv) {
+async fn run_server(server: RunningServer<TcpStream>, mut stop_handle_rcv: stop_handle::StopHandleRcv) {
     let Ok(listener) = tokio::net::TcpListener::bind(&"127.0.0.1:8002").await else {
         eprintln!("Cannot bind port");
         return;
     };
     let mut connid = 1;
     loop {
-        let Ok((socket, _)) = tokio::select! {
+        let Ok((mut conn, _)) = tokio::select! {
             _ = stop_handle_rcv.wait() => break,
             c = listener.accept() => c,
         } else { break; };
-        let (r, mut w) = socket.into_split();
         connid += 1;
-        if let Err(e) = w.write_u32(connid).await {
+        if let Err(e) = conn.write_u32(connid).await {
             eprintln!("Write error: {}", e);
         }
-        if let Err(e) = w.flush().await {
+        if let Err(e) = conn.flush().await {
             eprintln!("Flush error: {}", e);
         }
-        if let Err(e) = server.push_connection((connid, Connection::new(w, r))).await {
+        if let Err(e) = server.push_connection((connid, conn)).await {
             eprintln!("Connection error: {}", e);
         }
     }
