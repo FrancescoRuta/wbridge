@@ -57,7 +57,11 @@ where
         let mut size = [0u8; 4];
         let mut cursor = 0;
         while cursor < size.len() {
-            cursor += self.0.read(&mut size).await.ok()?;
+            let len = self.0.read(&mut size).await.ok()?;
+            cursor += len;
+            if len == 0 {
+                return None;
+            }
         }
         let msg_size = u32::from_be_bytes(size);
         let size = msg_size as usize + HEADER_SIZE;

@@ -16,6 +16,7 @@ pub struct RunningServer<Connection> {
     broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
     accept_connection_tx: tokio::sync::mpsc::Sender<(u32, Connection)>,
     server_future: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync + 'static>>>,
+    stop_tx_list: Arc<Mutex<BTreeMap<u32, tokio::sync::mpsc::Sender<tokio::sync::mpsc::Sender<()>>>>>,
 }
 
 impl<Connection> Server<Connection>
@@ -39,11 +40,13 @@ where
         } = self;
         let connections = Arc::new(DashMap::new());
         let broadcast_subscriptions = Arc::new(DashMap::new());
+        let stop_tx_list = Arc::new(Mutex::new(BTreeMap::new()));
         let server_future = tokio::spawn({
             let connections = Arc::clone(&connections);
             let broadcast_subscriptions = Arc::clone(&broadcast_subscriptions);
+            let stop_tx_list = Arc::clone(&stop_tx_list);
             async move {
-                let runtime = ServerRuntime::new(connections, broadcast_subscriptions);
+                let runtime = ServerRuntime::new(connections, broadcast_subscriptions, stop_tx_list);
                 loop {
                     tokio::select! {
                         _ = stop_rx.wait() => break,
@@ -64,6 +67,7 @@ where
             broadcast_subscriptions,
             accept_connection_tx,
             server_future,
+            stop_tx_list,
             stop_tx,
         }
     }
@@ -96,7 +100,28 @@ impl<Connection> RunningServer<Connection> {
     
     pub async fn stop(self) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
         self.stop_tx.send_stop().await;
-        self.server_future.await?
+        self.server_future.await??;
+        Self::stop_clients(self.stop_tx_list).await;
+        Ok(())
+    }
+    
+    async fn stop_clients(stop_tx_list: Arc<Mutex<BTreeMap<u32, tokio::sync::mpsc::Sender<tokio::sync::mpsc::Sender<()>>>>>) {
+        let stop_handles = {
+            let stop_tx_list = stop_tx_list.lock();
+            let ss = stop_tx_list.iter().map(|(_, s)| s.clone()).collect::<Vec<_>>();
+            drop(stop_tx_list);
+            ss
+        };
+        let mut r = Vec::with_capacity(stop_handles.len());
+        for s in stop_handles {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            if s.send(tx).await.is_ok() {
+                r.push(rx);
+            }
+        }
+        for mut r in r {
+            let _ = r.recv().await;
+        }
     }
     
 }
@@ -110,10 +135,10 @@ struct ServerRuntime {
 
 impl ServerRuntime {
     
-    pub fn new(connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>, broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>) -> Self {
+    pub fn new(connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>, broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>, stop_tx_list: Arc<Mutex<BTreeMap<u32, tokio::sync::mpsc::Sender<tokio::sync::mpsc::Sender<()>>>>>) -> Self {
         Self {
             is_stopped: AtomicBool::new(false),
-            stop_tx_list: Arc::new(Mutex::new(BTreeMap::new())),
+            stop_tx_list,
             connections,
             broadcast_subscriptions,
         }
