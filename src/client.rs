@@ -80,13 +80,17 @@ where
                         
                         if to_conn == 0 {
                             let brid = (from_conn as u64) << 32 | from_channel as u64;
-                            if let Some(b) = {broadcast_subscriptions.get(&brid).map(|b| b.clone())} {
-                                if b.send(BroadcastMessage {
-                                    from_conn,
-                                    from_channel,
-                                    data: message.slice(HEADER_SIZE..),
-                                }).await.is_err() {
-                                    broadcast_subscriptions.remove(&brid);
+                            if to_channel == 1 {
+                                broadcast_subscriptions.remove(&brid);
+                            } else {
+                                if let Some(b) = {broadcast_subscriptions.get(&brid).map(|b| b.clone())} {
+                                    if b.send(BroadcastMessage {
+                                        from_conn,
+                                        from_channel,
+                                        data: message.slice(HEADER_SIZE..),
+                                    }).await.is_err() {
+                                        broadcast_subscriptions.remove(&brid);
+                                    }
                                 }
                             }
                         } else {

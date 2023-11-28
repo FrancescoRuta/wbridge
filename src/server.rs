@@ -236,13 +236,13 @@ impl ServerRuntime {
                     let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
                     let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
                     let to_conn = u32::from_be_bytes([message[12], message[13], message[14], message[15]]);
-                    let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
+                    //let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
                     
                     if from_conn == id {
                         if to_conn == 0 {
                             let broadcast_channel = (from_conn as u64) << 32 | from_channel as u64;
                             let channels = broadcast_subscriptions.entry(broadcast_channel).or_insert_with(|| {
-                                broadcast_channels.push(broadcast_channel);
+                                broadcast_channels.push((from_channel, broadcast_channel));
                                 DashMap::new()
                             })
                                 .iter()
@@ -272,7 +272,7 @@ impl ServerRuntime {
                             result.put_u32(from_conn);
                             result.put_u32(from_channel);
                             result.put_u32(0);
-                            result.put_u32(to_channel);
+                            result.put_u32(0);
                             // Subscribe
                             if let Some(c) = broadcast_subscriptions.get(&broadcast_channel) {
                                 c.insert(id, conn_tx.clone());
@@ -296,8 +296,24 @@ impl ServerRuntime {
                     let _ = snd.send(()).await;
                 }
                 let _ = r_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
-                for channel in broadcast_channels {
-                    broadcast_subscriptions.remove(&channel);
+                for (channel_id, channel) in broadcast_channels {
+                    let mut close_message = bytes::BytesMut::with_capacity(HEADER_SIZE + 1);
+                    close_message.put_u32(0);
+                    close_message.put_u32(id);
+                    close_message.put_u32(channel_id);
+                    close_message.put_u32(0);
+                    close_message.put_u32(1);
+                    let close_message = close_message.freeze();
+                    let chs = if let dashmap::mapref::entry::Entry::Occupied(e) = broadcast_subscriptions.entry(channel) {
+                        Some(e.remove())
+                    } else {
+                        None
+                    };
+                    if let Some(chs) = chs {
+                        for (_, ch) in chs {
+                            let _ = ch.send(close_message.clone()).await;
+                        }
+                    }
                 }
             };
             tokio::join!(rh, wh);
