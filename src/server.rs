@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, sync::{atomic::AtomicBool, Arc}, marker::Phanto
 use bytes::BufMut;
 use dashmap::DashMap;
 use parking_lot::Mutex;
-use crate::{stop_handle::StopHandleSnd, message::{PrepardMessage, Message, BroadcastMessage, FrozenMessage}, HEADER_SIZE, connection::DuplexConnection};
+use crate::{connection::ConnectionManager, message::{BroadcastMessage, FrozenMessage, Message, PrepardMessage}, stop_handle::StopHandleSnd, HEADER_SIZE};
 
 pub struct Server<Connection> {
     accept_connection_tx: tokio::sync::mpsc::Sender<(u32, Connection)>,
@@ -21,7 +21,7 @@ pub struct RunningServer<Connection> {
 
 impl<Connection> Server<Connection>
 where
-    Connection: DuplexConnection + Send + 'static,
+    Connection: ConnectionManager + Send + 'static,
 {
     
     pub fn new() -> Self {
@@ -144,7 +144,7 @@ impl ServerRuntime {
         }
     }
     
-    pub async fn push_connection<Connection: DuplexConnection + Send + 'static>(&self, (id, mut conn): (u32, Connection)) -> Result<(), ()> {
+    pub async fn push_connection<Connection: ConnectionManager + Send + 'static>(&self, (id, conn): (u32, Connection)) -> Result<(), ()> {
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::channel(1);
         let stop_tx_list = Arc::clone(&self.stop_tx_list);
         
@@ -153,7 +153,7 @@ impl ServerRuntime {
             if self.is_stopped.load(std::sync::atomic::Ordering::SeqCst) { return Err(()); }
             stop_tx_list.insert(id, stop_tx.clone())
         };
-        let (conn_tx, mut conn_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
+        let (conn_tx, conn_rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(16);
         let connections = Arc::clone(&self.connections);
         connections.insert(id, conn_tx.clone());
         
@@ -164,10 +164,8 @@ impl ServerRuntime {
             }
         }
         
-        let r_notify_stop = stop_tx.clone();
-        let w_notify_stop = stop_tx;
-        let (stop_wh_tx, mut stop_wh_rx) = tokio::sync::mpsc::channel::<tokio::sync::mpsc::Sender<()>>(1);
-        let (stop_rh_tx, mut stop_rh_rx) = tokio::sync::mpsc::channel::<tokio::sync::mpsc::Sender<()>>(1);
+        let (stop_wh_tx, stop_wh_rx) = tokio::sync::mpsc::channel::<tokio::sync::mpsc::Sender<()>>(1);
+        let (stop_rh_tx, stop_rh_rx) = tokio::sync::mpsc::channel::<tokio::sync::mpsc::Sender<()>>(1);
         let broadcast_subscriptions = Arc::clone(&self.broadcast_subscriptions);
         tokio::spawn({
             let connections = Arc::clone(&connections);
@@ -196,128 +194,7 @@ impl ServerRuntime {
                 connections.remove(&id);
             }
         });
-        tokio::spawn(async move {
-            let (mut wh, mut rh) = conn.split();
-            let wh = async move {
-                let snd = loop {
-                    tokio::select! {
-                        snd = stop_wh_rx.recv() => break snd,
-                        message = conn_rx.recv() => {
-                            if let Some(message) = message {
-                                if wh.snd(message).await.is_err() {
-                                    break None;
-                                }
-                            } else {
-                                break None;
-                            }
-                        },
-                    }
-                };
-                if let Some(snd) = snd {
-                    let _ = snd.send(()).await;
-                }
-                let _ = w_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
-            };
-            let rh = async move {
-                let mut broadcast_channels = Vec::new();
-                let snd = loop {
-                    let message = tokio::select! {
-                        snd = stop_rh_rx.recv() => break snd,
-                        message = rh.rcv() => {
-                            if let Some(message) = message {
-                                if message.len() < 20 { continue; }
-                                message
-                            } else {
-                                break None;
-                            }
-                        },
-                    };
-                    
-                    let from_conn = u32::from_be_bytes([message[4], message[5], message[6], message[7]]);
-                    let from_channel = u32::from_be_bytes([message[8], message[9], message[10], message[11]]);
-                    let to_conn = u32::from_be_bytes([message[12], message[13], message[14], message[15]]);
-                    //let to_channel = u32::from_be_bytes([message[16], message[17], message[18], message[19]]);
-                    
-                    if from_conn == id {
-                        if to_conn == 0 {
-                            let broadcast_channel = (from_conn as u64) << 32 | from_channel as u64;
-                            let channels = broadcast_subscriptions.entry(broadcast_channel).or_insert_with(|| {
-                                broadcast_channels.push((from_channel, broadcast_channel));
-                                DashMap::new()
-                            })
-                                .iter()
-                                .map(|d| (*d.key(), d.value().clone()))
-                                .collect::<Vec<_>>();
-                            let mut broken_channels = Vec::new();
-                            for (key, channel) in channels {
-                                if channel.send(message.clone()).await.is_err() {
-                                    broken_channels.push(key);
-                                }
-                            }
-                            if broken_channels.len() > 0 {
-                                if let Some(m) = broadcast_subscriptions.get(&broadcast_channel) {
-                                    broken_channels.iter().for_each(|k| { m.remove(k); });
-                                }
-                            }
-                        } else {
-                            if let Some(data_tx) = connections.get(&to_conn).map(|c| c.clone()) {
-                                let _ = data_tx.send(message).await;
-                            }
-                        }
-                    } else {
-                        let broadcast_channel = (from_conn as u64) << 32 | from_channel as u64;
-                        if to_conn == 0 {
-                            let mut result = bytes::BytesMut::with_capacity(HEADER_SIZE + 1);
-                            result.put_u32(1);
-                            result.put_u32(from_conn);
-                            result.put_u32(from_channel);
-                            result.put_u32(0);
-                            result.put_u32(0);
-                            // Subscribe
-                            if let Some(c) = broadcast_subscriptions.get(&broadcast_channel) {
-                                c.insert(id, conn_tx.clone());
-                                result.put_u8(0);
-                                let _ = conn_tx.send(result.freeze()).await;
-                            } else {
-                                result.put_u8(1);
-                                let _ = conn_tx.send(result.freeze()).await;
-                            }
-                        } else {
-                            // Unsubscribe
-                            if let Some(c) = broadcast_subscriptions.get(&broadcast_channel) {
-                                c.remove(&id);
-                            }
-                        }
-                        
-                    }
-                    
-                };
-                if let Some(snd) = snd {
-                    let _ = snd.send(()).await;
-                }
-                let _ = r_notify_stop.send(tokio::sync::mpsc::channel::<()>(1).0).await;
-                for (channel_id, channel) in broadcast_channels {
-                    let mut close_message = bytes::BytesMut::with_capacity(HEADER_SIZE + 1);
-                    close_message.put_u32(0);
-                    close_message.put_u32(id);
-                    close_message.put_u32(channel_id);
-                    close_message.put_u32(0);
-                    close_message.put_u32(1);
-                    let close_message = close_message.freeze();
-                    let chs = if let dashmap::mapref::entry::Entry::Occupied(e) = broadcast_subscriptions.entry(channel) {
-                        Some(e.remove())
-                    } else {
-                        None
-                    };
-                    if let Some(chs) = chs {
-                        for (_, ch) in chs {
-                            let _ = ch.send(close_message.clone()).await;
-                        }
-                    }
-                }
-            };
-            tokio::join!(rh, wh);
-        });
+        conn.manage(id, broadcast_subscriptions, connections, conn_tx, stop_wh_rx, stop_rh_rx, conn_rx, stop_tx);
         
         Ok(())
     }

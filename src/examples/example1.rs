@@ -6,6 +6,7 @@ pub mod server;
 mod stop_handle;
 
 use client::Client;
+use connection::StConnectionManager;
 use server::{Server, RunningServer};
 use tokio::{io::{AsyncWriteExt, AsyncReadExt}, time::Instant, net::TcpStream};
 
@@ -104,7 +105,7 @@ async fn main() {
     let _ = server_conn_handle.await;
 }
 
-async fn run_server(server: RunningServer<TcpStream>, mut stop_handle_rcv: stop_handle::StopHandleRcv) {
+async fn run_server(server: RunningServer<StConnectionManager<TcpStream>>, mut stop_handle_rcv: stop_handle::StopHandleRcv) {
     let Ok(listener) = tokio::net::TcpListener::bind(&"127.0.0.1:8002").await else {
         eprintln!("Cannot bind port");
         return;
@@ -122,7 +123,7 @@ async fn run_server(server: RunningServer<TcpStream>, mut stop_handle_rcv: stop_
         if let Err(e) = conn.flush().await {
             eprintln!("Flush error: {}", e);
         }
-        if let Err(e) = server.push_connection((connid, conn)).await {
+        if let Err(e) = server.push_connection((connid, StConnectionManager::new(conn))).await {
             eprintln!("Connection error: {}", e);
         }
     }
