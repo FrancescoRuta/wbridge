@@ -80,7 +80,7 @@ impl<Connection> RunningServer<Connection> {
         self.accept_connection_tx.send(conn).await
     }
     
-    pub async fn push_connection_async<F: std::future::Future<Output = Option<Connection>> + Send + 'static>(&self, conn: (u32, F), callback: impl FnOnce(Option<Result<(), tokio::sync::mpsc::error::SendError<(u32, Connection)>>>) + Send + 'static) where Connection: Send + 'static {
+    pub fn push_connection_async<F: std::future::Future<Output = Option<Connection>> + Send + 'static>(&self, conn: (u32, F), callback: impl FnOnce(Option<Result<(), tokio::sync::mpsc::error::SendError<(u32, Connection)>>>) + Send + 'static) where Connection: Send + 'static {
         let accept_connection_tx = self.accept_connection_tx.clone();
         tokio::spawn(async move {
             let (id, conn) = conn;
