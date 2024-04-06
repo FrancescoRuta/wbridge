@@ -273,6 +273,7 @@ impl LocalConnection {
         LocalConnectionWriterFactory {
             conn_id: self.connection_id,
             connections: Arc::clone(&self.connections),
+            broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
         }
     }
     
@@ -358,6 +359,7 @@ impl BroadcastSubscription {
 pub struct LocalConnectionWriterFactory {
     conn_id: u32,
     connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
 }
 
 impl LocalConnectionWriterFactory {
@@ -367,6 +369,8 @@ impl LocalConnectionWriterFactory {
             conn_id: self.conn_id,
             channel_id: channel,
             connections: Arc::clone(&self.connections),
+            broadcast_subscriptions: Arc::clone(&self.broadcast_subscriptions),
+            broadcast_channels: Vec::new(),
         }
     }
     
@@ -378,6 +382,8 @@ pub struct LocalConnectionWriter {
     conn_id: u32,
     channel_id: u32,
     connections: Arc<DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>,
+    broadcast_subscriptions: Arc<DashMap<u64, DashMap<u32, tokio::sync::mpsc::Sender<bytes::Bytes>>>>,
+    broadcast_channels: Vec<(u32, u64)>,
 }
 
 impl LocalConnectionWriter {
@@ -386,6 +392,27 @@ impl LocalConnectionWriter {
     }
     pub fn id(&self) -> u32 {
         self.channel_id
+    }
+    async fn send_broadcast_internal(&mut self, message: bytes::Bytes) {
+        let broadcast_channel = (self.conn_id as u64) << 32 | self.channel_id as u64;
+        let channels = self.broadcast_subscriptions.entry(broadcast_channel).or_insert_with(|| {
+            self.broadcast_channels.push((self.channel_id, broadcast_channel));
+            DashMap::new()
+        })
+            .iter()
+            .map(|d| (*d.key(), d.value().clone()))
+            .collect::<Vec<_>>();
+        let mut broken_channels = Vec::new();
+        for (key, channel) in channels {
+            if channel.send(message.clone()).await.is_err() {
+                broken_channels.push(key);
+            }
+        }
+        if broken_channels.len() > 0 {
+            if let Some(m) = self.broadcast_subscriptions.get(&broadcast_channel) {
+                broken_channels.iter().for_each(|k| { m.remove(k); });
+            }
+        }
     }
     pub async fn send(&self, addr: u32, channel: u32, data: impl AsRef<[u8]>) -> Result<(), ()> {
         if let Some(c) = {self.connections.get(&addr).map(|c| c.clone())} {
@@ -406,8 +433,16 @@ impl LocalConnectionWriter {
             Err(())
         }
     }
-    pub async fn send_broadcast(&self, data: impl AsRef<[u8]>) -> Result<(), ()> {
-        self.send(0, 0, data).await
+    pub async fn send_broadcast(&mut self, data: impl AsRef<[u8]>) {
+        let data = data.as_ref();
+        let mut request = bytes::BytesMut::with_capacity(20 + data.len());
+        request.put_u32(data.len() as u32);
+        request.put_u32(self.conn_id);
+        request.put_u32(self.channel_id);
+        request.put_u32(0);
+        request.put_u32(0);
+        request.put_slice(data);
+        self.send_broadcast_internal(request.freeze()).await;
     }
     pub async fn send_prepared<'a>(&'a self, addr: u32, channel: u32, mut message: PrepardMessage) -> Result<FrozenMessage<'a>, ()> {
         if let Some(c) = {self.connections.get(&addr).map(|c| c.clone())} {
@@ -426,8 +461,13 @@ impl LocalConnectionWriter {
             Err(())
         }
     }
-    pub async fn send_prepared_broadcast<'a>(&'a self, message: PrepardMessage) -> Result<FrozenMessage<'a>, ()> {
-        self.send_prepared(0, 0, message).await
+    pub async fn send_prepared_broadcast<'a>(&'a mut self, mut message: PrepardMessage) {
+        message.buffer[0..4].copy_from_slice(&(message.len as u32).to_be_bytes());
+        message.buffer[4..8].copy_from_slice(&self.conn_id().to_be_bytes());
+        message.buffer[8..12].copy_from_slice(&self.id().to_be_bytes());
+        message.buffer[12..16].copy_from_slice(&0u32.to_be_bytes());
+        message.buffer[16..20].copy_from_slice(&0u32.to_be_bytes());
+        self.send_broadcast_internal(message.buffer.freeze()).await;
     }
     pub async fn send_frozen(&self, message: &FrozenMessage<'_>) -> Result<(), ()> {
         if let Some(c) = {self.connections.get(&message.0).map(|c| c.clone())} {
