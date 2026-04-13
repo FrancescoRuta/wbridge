@@ -32,8 +32,8 @@ impl DuplexConnection for tokio::net::UnixStream {
     }
 }
 
-pub struct ConnectionWriteHalf<T>(T);
-pub struct ConnectionReadHalf<T>(T);
+pub struct ConnectionWriteHalf<T>(pub T);
+pub struct ConnectionReadHalf<T>(pub T);
 
 
 impl<T> ConnectionWriteHalf<T>
