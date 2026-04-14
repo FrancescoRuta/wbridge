@@ -110,6 +110,7 @@ where
                     r_notify_stop.send_stop().await;
                 };
                 tokio::join!(rh, wh);
+                connection.on_close();
             }
         }));
         
